@@ -1,4 +1,3 @@
-
 import java.awt.*;
 import java.awt.event.*;
 import java.sql.*;
@@ -8,6 +7,9 @@ import java.util.regex.Pattern;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.table.DefaultTableModel;
+import java.io.FileWriter;
+import java.io.IOException;
+import javax.swing.filechooser.FileNameExtensionFilter;
 
 // Model Classes
 class Patient {
@@ -68,6 +70,33 @@ class Patient {
     }
 }
 
+class Visit {
+    private int id;
+    private int patientId;
+    private java.sql.Date visitDate;
+    private String doctor;
+    private String notes;
+
+    public Visit(int id, int patientId, java.sql.Date visitDate, String doctor, String notes) {
+        this.id = id;
+        this.patientId = patientId;
+        this.visitDate = visitDate;
+        this.doctor = doctor;
+        this.notes = notes;
+    }
+    public Visit(int patientId, java.sql.Date visitDate, String doctor, String notes) {
+        this.patientId = patientId;
+        this.visitDate = visitDate;
+        this.doctor = doctor;
+        this.notes = notes;
+    }
+    public int getId() { return id; }
+    public int getPatientId() { return patientId; }
+    public java.sql.Date getVisitDate() { return visitDate; }
+    public String getDoctor() { return doctor; }
+    public String getNotes() { return notes; }
+}
+
 class DatabaseConfig {
 
     // These should ideally be loaded from a configuration file
@@ -104,6 +133,23 @@ class DatabaseConfig {
                 }
             } catch (SQLException e) {
                 System.err.println("Error checking/creating patients table: " + e.getMessage());
+            }
+
+            // Check if visits table exists
+            try {
+                ResultSet rs = conn.getMetaData().getTables(null, USER.toUpperCase(), "VISITS", null);
+                if (!rs.next()) {
+                    stmt.execute("CREATE TABLE visits ("
+                        + "id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+                        + "patient_id NUMBER NOT NULL, "
+                        + "visit_date DATE NOT NULL, "
+                        + "doctor VARCHAR2(100) NOT NULL, "
+                        + "notes VARCHAR2(500), "
+                        + "FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE)");
+                    System.out.println("Visits table created successfully");
+                }
+            } catch (SQLException e) {
+                System.err.println("Error checking/creating visits table: " + e.getMessage());
             }
 
         } catch (SQLException e) {
@@ -219,6 +265,38 @@ class PatientDAO {
     }
 }
 
+class VisitDAO {
+    public void addVisit(Visit v) throws SQLException {
+        String sql = "INSERT INTO visits (patient_id, visit_date, doctor, notes) VALUES (?, ?, ?, ?)";
+        try (Connection conn = DatabaseConfig.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, v.getPatientId());
+            ps.setDate(2, v.getVisitDate());
+            ps.setString(3, v.getDoctor());
+            ps.setString(4, v.getNotes());
+            ps.executeUpdate();
+        }
+    }
+    public List<Visit> getVisitsForPatient(int patientId) throws SQLException {
+        List<Visit> visits = new ArrayList<>();
+        String sql = "SELECT id, patient_id, visit_date, doctor, notes FROM visits WHERE patient_id = ? ORDER BY visit_date DESC";
+        try (Connection conn = DatabaseConfig.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, patientId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    visits.add(new Visit(
+                        rs.getInt("id"),
+                        rs.getInt("patient_id"),
+                        rs.getDate("visit_date"),
+                        rs.getString("doctor"),
+                        rs.getString("notes")
+                    ));
+                }
+            }
+        }
+        return visits;
+    }
+}
+
 // GUI Classes
 class PatientFormPanel extends JPanel {
 
@@ -231,6 +309,8 @@ class PatientFormPanel extends JPanel {
     private JButton actionButton;
     private JButton clearButton;
     private JButton deleteButton;
+    private JButton visitHistoryButton;
+    private VisitDAO visitDAO = new VisitDAO();
 
     private int currentPatientId = -1;
     private PatientDAO patientDAO;
@@ -338,9 +418,16 @@ class PatientFormPanel extends JPanel {
         deleteButton.setFocusPainted(false);
         deleteButton.setEnabled(false);
 
+        visitHistoryButton = new JButton("Visit History");
+        visitHistoryButton.setBackground(new Color(70, 130, 180));
+        visitHistoryButton.setForeground(Color.WHITE);
+        visitHistoryButton.setFocusPainted(false);
+        visitHistoryButton.setEnabled(false);
+
         buttonPanel.add(actionButton);
         buttonPanel.add(clearButton);
         buttonPanel.add(deleteButton);
+        buttonPanel.add(visitHistoryButton);
 
         add(buttonPanel, BorderLayout.SOUTH);
 
@@ -348,6 +435,7 @@ class PatientFormPanel extends JPanel {
         actionButton.addActionListener(e -> savePatient());
         clearButton.addActionListener(e -> clearForm());
         deleteButton.addActionListener(e -> deletePatient());
+        visitHistoryButton.addActionListener(e -> showVisitHistoryDialog());
     }
 
     private void savePatient() {
@@ -468,6 +556,7 @@ class PatientFormPanel extends JPanel {
         currentPatientId = -1;
         actionButton.setText("Add Patient");
         deleteButton.setEnabled(false);
+        visitHistoryButton.setEnabled(false);
     }
 
     public void loadPatient(int patientId) {
@@ -499,11 +588,92 @@ class PatientFormPanel extends JPanel {
 
                 actionButton.setText("Update Patient");
                 deleteButton.setEnabled(true);
+                visitHistoryButton.setEnabled(true);
             }
         } catch (SQLException ex) {
             JOptionPane.showMessageDialog(this, "Error loading patient: " + ex.getMessage(),
                     "Database Error", JOptionPane.ERROR_MESSAGE);
         }
+    }
+
+    private void showVisitHistoryDialog() {
+        if (currentPatientId == -1) {
+            JOptionPane.showMessageDialog(this, "No patient selected.", "Error", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        JDialog dialog = new JDialog((JFrame) SwingUtilities.getWindowAncestor(this), "Visit History", true);
+        dialog.setSize(600, 400);
+        dialog.setLocationRelativeTo(this);
+        dialog.setLayout(new BorderLayout());
+
+        // Table for visits
+        String[] columns = {"Date", "Doctor", "Notes"};
+        DefaultTableModel model = new DefaultTableModel(columns, 0) {
+            public boolean isCellEditable(int row, int col) { return false; }
+        };
+        JTable table = new JTable(model);
+        JScrollPane scrollPane = new JScrollPane(table);
+        dialog.add(scrollPane, BorderLayout.CENTER);
+
+        // Load visits
+        try {
+            for (Visit v : visitDAO.getVisitsForPatient(currentPatientId)) {
+                model.addRow(new Object[] { v.getVisitDate(), v.getDoctor(), v.getNotes() });
+            }
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, "Error loading visits: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        }
+
+        // Panel to add new visit
+        JPanel addPanel = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(5,5,5,5);
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.gridx = 0; gbc.gridy = 0;
+        addPanel.add(new JLabel("Date (yyyy-mm-dd):"), gbc);
+        gbc.gridx = 1;
+        JTextField dateField = new JTextField(10);
+        dateField.setText(new java.text.SimpleDateFormat("yyyy-MM-dd").format(new java.util.Date()));
+        addPanel.add(dateField, gbc);
+        gbc.gridx = 0; gbc.gridy = 1;
+        addPanel.add(new JLabel("Doctor:"), gbc);
+        gbc.gridx = 1;
+        JTextField doctorField = new JTextField(15);
+        addPanel.add(doctorField, gbc);
+        gbc.gridx = 0; gbc.gridy = 2;
+        addPanel.add(new JLabel("Notes:"), gbc);
+        gbc.gridx = 1;
+        JTextField notesField = new JTextField(20);
+        addPanel.add(notesField, gbc);
+        gbc.gridx = 0; gbc.gridy = 3; gbc.gridwidth = 2;
+        JButton addVisitBtn = new JButton("Add Visit");
+        addPanel.add(addVisitBtn, gbc);
+        dialog.add(addPanel, BorderLayout.SOUTH);
+
+        addVisitBtn.addActionListener(ev -> {
+            try {
+                java.sql.Date visitDate = java.sql.Date.valueOf(dateField.getText().trim());
+                String doctor = doctorField.getText().trim();
+                String notes = notesField.getText().trim();
+                if (doctor.isEmpty()) {
+                    JOptionPane.showMessageDialog(dialog, "Doctor name required.", "Validation Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+                Visit v = new Visit(currentPatientId, visitDate, doctor, notes);
+                visitDAO.addVisit(v);
+                model.setRowCount(0);
+                for (Visit visit : visitDAO.getVisitsForPatient(currentPatientId)) {
+                    model.addRow(new Object[] { visit.getVisitDate(), visit.getDoctor(), visit.getNotes() });
+                }
+                doctorField.setText("");
+                notesField.setText("");
+                JOptionPane.showMessageDialog(dialog, "Visit added!", "Success", JOptionPane.INFORMATION_MESSAGE);
+            } catch (Exception ex) {
+                JOptionPane.showMessageDialog(dialog, "Error adding visit: " + ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+            }
+        });
+
+        dialog.setVisible(true);
     }
 }
 
@@ -727,10 +897,16 @@ public class HospitalManagementSystem extends JFrame {
 
     public HospitalManagementSystem() {
         try {
-            // Set look and feel to system
-            UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+            // Set look and feel to Nimbus for modern UI
+            for (UIManager.LookAndFeelInfo info : UIManager.getInstalledLookAndFeels()) {
+                if ("Nimbus".equals(info.getName())) {
+                    UIManager.setLookAndFeel(info.getClassName());
+                    break;
+                }
+            }
         } catch (Exception e) {
-            e.printStackTrace();
+            // fallback to system look and feel
+            try { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()); } catch (Exception ex) {}
         }
 
         setTitle("Hospital Management System");
@@ -792,6 +968,11 @@ public class HospitalManagementSystem extends JFrame {
             statusBar.setStatus("Data refreshed");
         });
 
+        JMenuItem exportItem = new JMenuItem("Export to CSV");
+        exportItem.setMnemonic(KeyEvent.VK_E);
+        exportItem.addActionListener(e -> exportPatientsToCSV());
+        fileMenu.add(exportItem);
+
         JMenuItem exitItem = new JMenuItem("Exit");
         exitItem.setMnemonic(KeyEvent.VK_X);
         exitItem.addActionListener(e -> System.exit(0));
@@ -833,6 +1014,46 @@ public class HospitalManagementSystem extends JFrame {
         menuBar.add(helpMenu);
 
         return menuBar;
+    }
+
+    private void exportPatientsToCSV() {
+        JFileChooser fileChooser = new JFileChooser();
+        fileChooser.setDialogTitle("Export Patients to CSV");
+        fileChooser.setFileFilter(new FileNameExtensionFilter("CSV Files", "csv"));
+        int userSelection = fileChooser.showSaveDialog(this);
+        if (userSelection == JFileChooser.APPROVE_OPTION) {
+            String filePath = fileChooser.getSelectedFile().getAbsolutePath();
+            if (!filePath.toLowerCase().endsWith(".csv")) {
+                filePath += ".csv";
+            }
+            try (FileWriter writer = new FileWriter(filePath)) {
+                writer.write("ID,Name,Age,Gender,Phone,Blood Group,Address\n");
+                for (Patient p : patientDAO.getAllPatients()) {
+                    writer.write(String.format("%d,%s,%d,%s,%s,%s,%s\n",
+                        p.getId(),
+                        escapeCsv(p.getName()),
+                        p.getAge(),
+                        escapeCsv(p.getGender()),
+                        escapeCsv(p.getPhone()),
+                        escapeCsv(p.getBloodGroup()),
+                        escapeCsv(p.getAddress())
+                    ));
+                }
+                JOptionPane.showMessageDialog(this, "Patients exported successfully!", "Export Complete", JOptionPane.INFORMATION_MESSAGE);
+                statusBar.setStatus("Patients exported to CSV");
+            } catch (IOException | SQLException ex) {
+                JOptionPane.showMessageDialog(this, "Error exporting patients: " + ex.getMessage(), "Export Error", JOptionPane.ERROR_MESSAGE);
+            }
+        }
+    }
+
+    private String escapeCsv(String value) {
+        if (value == null) return "";
+        if (value.contains(",") || value.contains("\"") || value.contains("\n")) {
+            value = value.replace("\"", "\"\"");
+            return '"' + value + '"';
+        }
+        return value;
     }
 
     public static void main(String[] args) {
